@@ -21,6 +21,7 @@ import io
 import os
 import json
 import base64
+import asyncio
 import tempfile
 from collections import defaultdict
 
@@ -305,8 +306,29 @@ async def ws(websocket: WebSocket):
                 if not frames:
                     await websocket.send_text(json.dumps({"type": "error", "msg": "no se pudieron leer frames"}))
                     continue
-                for update in process_video(frames, msg.get("prompt", ""),
-                                            float(msg.get("min_presence", 0.25))):
+
+                # Corremos el procesamiento pesado en un hilo aparte para NO
+                # bloquear el event loop (si no, el WebSocket "muere" por timeout).
+                # El hilo empuja cada update a una cola; aquí los enviamos.
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue = asyncio.Queue()
+                prompt = msg.get("prompt", "")
+                mp = float(msg.get("min_presence", 0.25))
+
+                def _worker():
+                    try:
+                        for update in process_video(frames, prompt, mp):
+                            loop.call_soon_threadsafe(queue.put_nowait, update)
+                    except Exception as e:
+                        loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "msg": str(e)})
+                    finally:
+                        loop.call_soon_threadsafe(queue.put_nowait, None)
+
+                loop.run_in_executor(None, _worker)
+                while True:
+                    update = await queue.get()
+                    if update is None:
+                        break
                     await websocket.send_text(json.dumps(update))
 
             else:
