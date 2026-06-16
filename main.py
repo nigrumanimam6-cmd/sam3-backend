@@ -187,9 +187,10 @@ class Tracker:
         return out
 
 
-def _extract_frames(video_bytes, max_frames=None, stride=1, target_fps=None):
+def _extract_frames(video_bytes, max_frames=None, stride=1, target_fps=None, max_seconds=None):
     """Escribe el video a un temporal y extrae sus frames como PIL.
     Si se da target_fps, calcula el stride a partir de los fps reales del video.
+    Si se da max_seconds, solo lee los primeros N segundos del video.
     Devuelve (frames, fps_efectivos)."""
     path = tempfile.mktemp(suffix=".mp4")
     with open(path, "wb") as f:
@@ -198,10 +199,13 @@ def _extract_frames(video_bytes, max_frames=None, stride=1, target_fps=None):
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if target_fps:
         stride = max(1, round(src_fps / float(target_fps)))
+    max_src = int(max_seconds * src_fps) if max_seconds else None
     frames, i = [], 0
     while True:
         ret, fr = cap.read()
         if not ret:
+            break
+        if max_src is not None and i >= max_src:
             break
         if i % max(1, stride) == 0:
             frames.append(Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
@@ -272,7 +276,12 @@ def process_video(frames, prompt, min_presence=0.25):
             if tid in sset:
                 r, g, b = color_of[tid]
                 ov[d["mask"]] = [r, g, b, 130]
-        yield {"type": "frame", "frame": fi, "overlay_png": _png_b64(ov)}
+        # frame original en jpg (para componer overlay encima en el cliente)
+        jb = io.BytesIO()
+        frames[fi].save(jb, format="JPEG", quality=70)
+        base_jpg = base64.b64encode(jb.getvalue()).decode("ascii")
+        yield {"type": "frame", "frame": fi,
+               "overlay_png": _png_b64(ov), "base_jpg": base_jpg}
 
     yield {"type": "result_done"}
 
@@ -288,10 +297,11 @@ def health():
     return {"status": "ok"}
 
 
-async def _run_video(websocket, video_bytes, prompt, mp, max_frames, stride, target_fps):
+async def _run_video(websocket, video_bytes, prompt, mp, max_frames, stride, target_fps, max_seconds=None):
     """Extrae frames, procesa en un hilo y transmite progreso + resultado en streaming."""
     frames, eff_fps = _extract_frames(video_bytes, max_frames=max_frames,
-                                      stride=stride, target_fps=target_fps)
+                                      stride=stride, target_fps=target_fps,
+                                      max_seconds=max_seconds)
     if not frames:
         await websocket.send_text(json.dumps({"type": "error", "msg": "no se pudieron leer frames"}))
         return
@@ -357,7 +367,7 @@ async def ws(websocket: WebSocket):
                 await _run_video(websocket, raw, msg.get("prompt", ""),
                                  float(msg.get("min_presence", 0.25)),
                                  msg.get("max_frames"), int(msg.get("stride", 1)),
-                                 msg.get("target_fps"))
+                                 msg.get("target_fps"), msg.get("max_seconds"))
 
             # --- Carga de video por PEDACITOS (chunks) — para Flutter -------
             elif t == "video_start":
@@ -368,6 +378,7 @@ async def ws(websocket: WebSocket):
                     "max_frames": msg.get("max_frames"),
                     "stride": int(msg.get("stride", 1)),
                     "target_fps": msg.get("target_fps"),
+                    "max_seconds": msg.get("max_seconds"),
                 }
                 await websocket.send_text(json.dumps({"type": "video_ack"}))
 
@@ -381,7 +392,8 @@ async def ws(websocket: WebSocket):
                                  video_meta.get("min_presence", 0.25),
                                  video_meta.get("max_frames"),
                                  video_meta.get("stride", 1),
-                                 video_meta.get("target_fps"))
+                                 video_meta.get("target_fps"),
+                                 video_meta.get("max_seconds"))
 
             else:
                 await websocket.send_text(json.dumps({"type": "error", "msg": "tipo no soportado"}))
