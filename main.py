@@ -221,12 +221,13 @@ def _extract_frames(video_bytes, max_frames=None, stride=1, target_fps=None, max
     return frames, eff_fps
 
 
-def process_video(frames, prompt, min_presence=0.25):
+def process_video(frames, prompt, min_presence=0.25, export_path=None, fps_out=10):
     """Generador en streaming:
        'progress'      -> por cada frame mientras detecta+rastrea
        'result_meta'   -> las capas (objetos + miniaturas + rastros), una vez
        'frame'         -> overlay compuesto, uno por frame (se transmiten en orden)
        'result_done'   -> al terminar
+    Si export_path se da, además escribe un mp4 compuesto (original + overlay).
     """
     N = len(frames)
     W, H = frames[0].size                       # PIL: (ancho, alto)
@@ -268,6 +269,12 @@ def process_video(frames, prompt, min_presence=0.25):
     yield {"type": "result_meta", "n_frames": N, "width": int(W), "height": int(H),
            "objects": objects}
 
+    # Escritor de mp4 (opcional) para la descarga
+    writer = None
+    if export_path:
+        writer = cv2.VideoWriter(export_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 float(fps_out) if fps_out else 10.0, (W, H))
+
     # Luego los overlays, uno por uno (no un mensajote de 16 MB)
     sset = set(stable)
     for fi, tracked in enumerate(per_frame):
@@ -276,12 +283,21 @@ def process_video(frames, prompt, min_presence=0.25):
             if tid in sset:
                 r, g, b = color_of[tid]
                 ov[d["mask"]] = [r, g, b, 130]
+        base = np.array(frames[fi])             # RGB original
         # frame original en jpg (para componer overlay encima en el cliente)
         jb = io.BytesIO()
         frames[fi].save(jb, format="JPEG", quality=70)
         base_jpg = base64.b64encode(jb.getvalue()).decode("ascii")
         yield {"type": "frame", "frame": fi,
                "overlay_png": _png_b64(ov), "base_jpg": base_jpg}
+
+        if writer is not None:
+            a = ov[..., 3:4].astype(np.float32) / 255.0
+            comp = (base * (1 - a) + ov[..., :3] * a).astype(np.uint8)
+            writer.write(cv2.cvtColor(comp, cv2.COLOR_RGB2BGR))
+
+    if writer is not None:
+        writer.release()
 
     yield {"type": "result_done"}
 
@@ -298,17 +314,20 @@ def health():
 
 
 async def _run_video(websocket, video_bytes, prompt, mp, max_frames, stride, target_fps, max_seconds=None):
-    """Extrae frames, procesa en un hilo y transmite progreso + resultado en streaming."""
+    """Extrae frames, procesa en un hilo y transmite progreso + resultado en streaming.
+    Devuelve la ruta del mp4 compuesto (para descarga)."""
     frames, eff_fps = _extract_frames(video_bytes, max_frames=max_frames,
                                       stride=stride, target_fps=target_fps,
                                       max_seconds=max_seconds)
     if not frames:
         await websocket.send_text(json.dumps({"type": "error", "msg": "no se pudieron leer frames"}))
-        return
+        return None
 
     # Avisar cuántos frames y a qué fps, antes de empezar el trabajo pesado
     await websocket.send_text(json.dumps(
         {"type": "video_info", "n_frames": len(frames), "proc_fps": eff_fps}))
+
+    export_path = tempfile.mktemp(suffix=".mp4")
 
     # Procesamiento pesado en un hilo aparte para NO bloquear el event loop.
     # El hilo empuja cada update a una cola; aqui los enviamos al cliente.
@@ -317,7 +336,8 @@ async def _run_video(websocket, video_bytes, prompt, mp, max_frames, stride, tar
 
     def _worker():
         try:
-            for update in process_video(frames, prompt, mp):
+            for update in process_video(frames, prompt, mp,
+                                        export_path=export_path, fps_out=eff_fps):
                 loop.call_soon_threadsafe(queue.put_nowait, update)
         except Exception as e:
             loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "msg": str(e)})
@@ -333,6 +353,8 @@ async def _run_video(websocket, video_bytes, prompt, mp, max_frames, stride, tar
             update["proc_fps"] = eff_fps
         await websocket.send_text(json.dumps(update))
 
+    return export_path
+
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
@@ -340,6 +362,7 @@ async def ws(websocket: WebSocket):
     current_image = None
     video_chunks = []        # buffer para carga por pedacitos
     video_meta = {}
+    last_export = None       # ruta del ultimo mp4 compuesto
     try:
         while True:
             msg = json.loads(await websocket.receive_text())
@@ -364,7 +387,7 @@ async def ws(websocket: WebSocket):
             # --- Carga de video en UN mensaje (para pruebas en Colab) -------
             elif t == "video":
                 raw = base64.b64decode(msg["data"])
-                await _run_video(websocket, raw, msg.get("prompt", ""),
+                last_export = await _run_video(websocket, raw, msg.get("prompt", ""),
                                  float(msg.get("min_presence", 0.25)),
                                  msg.get("max_frames"), int(msg.get("stride", 1)),
                                  msg.get("target_fps"), msg.get("max_seconds"))
@@ -388,12 +411,26 @@ async def ws(websocket: WebSocket):
             elif t == "video_end":
                 raw = base64.b64decode("".join(video_chunks))
                 video_chunks = []
-                await _run_video(websocket, raw, video_meta.get("prompt", ""),
+                last_export = await _run_video(websocket, raw, video_meta.get("prompt", ""),
                                  video_meta.get("min_presence", 0.25),
                                  video_meta.get("max_frames"),
                                  video_meta.get("stride", 1),
                                  video_meta.get("target_fps"),
                                  video_meta.get("max_seconds"))
+
+            # --- Descargar el mp4 compuesto (por chunks) --------------------
+            elif t == "export_video":
+                if not last_export or not os.path.exists(last_export):
+                    await websocket.send_text(json.dumps({"type": "error", "msg": "procesa un video primero"}))
+                    continue
+                with open(last_export, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                await websocket.send_text(json.dumps({"type": "export_start", "size": len(b64)}))
+                CH = 256 * 1024
+                for i in range(0, len(b64), CH):
+                    await websocket.send_text(json.dumps(
+                        {"type": "export_chunk", "data": b64[i:i + CH]}))
+                await websocket.send_text(json.dumps({"type": "export_end"}))
 
             else:
                 await websocket.send_text(json.dumps({"type": "error", "msg": "tipo no soportado"}))
