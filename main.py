@@ -187,12 +187,17 @@ class Tracker:
         return out
 
 
-def _extract_frames(video_bytes, max_frames=None, stride=1):
-    """Escribe el video a un temporal y extrae sus frames como PIL."""
+def _extract_frames(video_bytes, max_frames=None, stride=1, target_fps=None):
+    """Escribe el video a un temporal y extrae sus frames como PIL.
+    Si se da target_fps, calcula el stride a partir de los fps reales del video.
+    Devuelve (frames, fps_efectivos)."""
     path = tempfile.mktemp(suffix=".mp4")
     with open(path, "wb") as f:
         f.write(video_bytes)
     cap = cv2.VideoCapture(path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if target_fps:
+        stride = max(1, round(src_fps / float(target_fps)))
     frames, i = [], 0
     while True:
         ret, fr = cap.read()
@@ -208,11 +213,17 @@ def _extract_frames(video_bytes, max_frames=None, stride=1):
         os.remove(path)
     except OSError:
         pass
-    return frames
+    eff_fps = round(src_fps / max(1, stride), 2)
+    return frames, eff_fps
 
 
 def process_video(frames, prompt, min_presence=0.25):
-    """Generador: emite 'progress' por frame y, al final, 'video_result'."""
+    """Generador en streaming:
+       'progress'      -> por cada frame mientras detecta+rastrea
+       'result_meta'   -> las capas (objetos + miniaturas + rastros), una vez
+       'frame'         -> overlay compuesto, uno por frame (se transmiten en orden)
+       'result_done'   -> al terminar
+    """
     N = len(frames)
     W, H = frames[0].size                       # PIL: (ancho, alto)
     tracker = Tracker(w_img=W)
@@ -249,18 +260,21 @@ def process_video(frames, prompt, min_presence=0.25):
             "thumb_png": _png_b64(rgba),
         })
 
+    # Primero la metadata (capas) -> el frontend ya puede pintar el panel
+    yield {"type": "result_meta", "n_frames": N, "width": int(W), "height": int(H),
+           "objects": objects}
+
+    # Luego los overlays, uno por uno (no un mensajote de 16 MB)
     sset = set(stable)
-    frames_out = []
     for fi, tracked in enumerate(per_frame):
         ov = np.zeros((H, W, 4), np.uint8)
         for tid, d, _ in tracked:
             if tid in sset:
                 r, g, b = color_of[tid]
                 ov[d["mask"]] = [r, g, b, 130]
-        frames_out.append({"frame": fi, "overlay_png": _png_b64(ov)})
+        yield {"type": "frame", "frame": fi, "overlay_png": _png_b64(ov)}
 
-    yield {"type": "video_result", "n_frames": N, "width": int(W), "height": int(H),
-           "objects": objects, "frames": frames_out}
+    yield {"type": "result_done"}
 
 
 # ============================================================================
@@ -274,10 +288,48 @@ def health():
     return {"status": "ok"}
 
 
+async def _run_video(websocket, video_bytes, prompt, mp, max_frames, stride, target_fps):
+    """Extrae frames, procesa en un hilo y transmite progreso + resultado en streaming."""
+    frames, eff_fps = _extract_frames(video_bytes, max_frames=max_frames,
+                                      stride=stride, target_fps=target_fps)
+    if not frames:
+        await websocket.send_text(json.dumps({"type": "error", "msg": "no se pudieron leer frames"}))
+        return
+
+    # Avisar cuántos frames y a qué fps, antes de empezar el trabajo pesado
+    await websocket.send_text(json.dumps(
+        {"type": "video_info", "n_frames": len(frames), "proc_fps": eff_fps}))
+
+    # Procesamiento pesado en un hilo aparte para NO bloquear el event loop.
+    # El hilo empuja cada update a una cola; aqui los enviamos al cliente.
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _worker():
+        try:
+            for update in process_video(frames, prompt, mp):
+                loop.call_soon_threadsafe(queue.put_nowait, update)
+        except Exception as e:
+            loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "msg": str(e)})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    loop.run_in_executor(None, _worker)
+    while True:
+        update = await queue.get()
+        if update is None:
+            break
+        if update.get("type") == "result_meta":
+            update["proc_fps"] = eff_fps
+        await websocket.send_text(json.dumps(update))
+
+
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     await websocket.accept()
     current_image = None
+    video_chunks = []        # buffer para carga por pedacitos
+    video_meta = {}
     try:
         while True:
             msg = json.loads(await websocket.receive_text())
@@ -299,37 +351,37 @@ async def ws(websocket: WebSocket):
                     "type": "mask", "prompt": msg.get("prompt", ""),
                     "n": n, "score": round(score, 4), "width": W, "height": H, "png": b64}))
 
+            # --- Carga de video en UN mensaje (para pruebas en Colab) -------
             elif t == "video":
                 raw = base64.b64decode(msg["data"])
-                frames = _extract_frames(raw, max_frames=msg.get("max_frames"),
-                                         stride=int(msg.get("stride", 1)))
-                if not frames:
-                    await websocket.send_text(json.dumps({"type": "error", "msg": "no se pudieron leer frames"}))
-                    continue
+                await _run_video(websocket, raw, msg.get("prompt", ""),
+                                 float(msg.get("min_presence", 0.25)),
+                                 msg.get("max_frames"), int(msg.get("stride", 1)),
+                                 msg.get("target_fps"))
 
-                # Corremos el procesamiento pesado en un hilo aparte para NO
-                # bloquear el event loop (si no, el WebSocket "muere" por timeout).
-                # El hilo empuja cada update a una cola; aquí los enviamos.
-                loop = asyncio.get_running_loop()
-                queue: asyncio.Queue = asyncio.Queue()
-                prompt = msg.get("prompt", "")
-                mp = float(msg.get("min_presence", 0.25))
+            # --- Carga de video por PEDACITOS (chunks) — para Flutter -------
+            elif t == "video_start":
+                video_chunks = []
+                video_meta = {
+                    "prompt": msg.get("prompt", ""),
+                    "min_presence": float(msg.get("min_presence", 0.25)),
+                    "max_frames": msg.get("max_frames"),
+                    "stride": int(msg.get("stride", 1)),
+                    "target_fps": msg.get("target_fps"),
+                }
+                await websocket.send_text(json.dumps({"type": "video_ack"}))
 
-                def _worker():
-                    try:
-                        for update in process_video(frames, prompt, mp):
-                            loop.call_soon_threadsafe(queue.put_nowait, update)
-                    except Exception as e:
-                        loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "msg": str(e)})
-                    finally:
-                        loop.call_soon_threadsafe(queue.put_nowait, None)
+            elif t == "video_chunk":
+                video_chunks.append(msg["data"])
 
-                loop.run_in_executor(None, _worker)
-                while True:
-                    update = await queue.get()
-                    if update is None:
-                        break
-                    await websocket.send_text(json.dumps(update))
+            elif t == "video_end":
+                raw = base64.b64decode("".join(video_chunks))
+                video_chunks = []
+                await _run_video(websocket, raw, video_meta.get("prompt", ""),
+                                 video_meta.get("min_presence", 0.25),
+                                 video_meta.get("max_frames"),
+                                 video_meta.get("stride", 1),
+                                 video_meta.get("target_fps"))
 
             else:
                 await websocket.send_text(json.dumps({"type": "error", "msg": "tipo no soportado"}))
