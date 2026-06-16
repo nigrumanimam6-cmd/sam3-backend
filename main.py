@@ -131,6 +131,7 @@ def _detect(image_pil, prompt):
             "bbox": (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
             "score": sc,
             "hist": _color_hist(img, mb),
+            "label": prompt,
         })
     return dets
 
@@ -234,8 +235,14 @@ def process_video(frames, prompt, min_presence=0.25, export_path=None, fps_out=1
     tracker = Tracker(w_img=W)
     per_frame, obj_frames = [], defaultdict(list)
 
+    # "small robot, orange ball" -> ["small robot", "orange ball"]
+    prompts = [p.strip() for p in prompt.split(",") if p.strip()] or [prompt]
+
     for fi, img in enumerate(frames):
-        tracked = tracker.update(_detect(img, prompt))
+        dets = []
+        for p in prompts:
+            dets.extend(_detect(img, p))        # una pasada por concepto
+        tracked = tracker.update(dets)
         per_frame.append(tracked)
         for tid, d, _ in tracked:
             obj_frames[tid].append((fi, d))
@@ -259,7 +266,7 @@ def process_video(frames, prompt, min_presence=0.25, export_path=None, fps_out=1
         objects.append({
             "id": int(tid),
             "color": list(color_of[tid]),
-            "label": prompt,
+            "label": d.get("label", prompt),
             "trail": [[float(dd["centroid"][0]), float(dd["centroid"][1])]
                       for _, dd in obj_frames[tid]],
             "thumb_png": _png_b64(rgba),
