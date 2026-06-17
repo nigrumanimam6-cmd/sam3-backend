@@ -108,6 +108,15 @@ def _hist_sim(h1, h2):
     return float(np.minimum(h1, h2).sum())
 
 
+def _translate(text):
+    """Traduce a ingles (auto-detecta idioma). Si falla, devuelve el original."""
+    try:
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source="auto", target="en").translate(text) or text
+    except Exception:
+        return text
+
+
 def _detect(image_pil, prompt):
     """Devuelve la lista de detecciones (multi-objeto) de UN frame."""
     img = np.array(image_pil)
@@ -235,13 +244,17 @@ def process_video(frames, prompt, min_presence=0.25, export_path=None, fps_out=1
     tracker = Tracker(w_img=W)
     per_frame, obj_frames = [], defaultdict(list)
 
-    # "small robot, orange ball" -> ["small robot", "orange ball"]
-    prompts = [p.strip() for p in prompt.split(",") if p.strip()] or [prompt]
+    # "robot pequeño, pelota naranja" -> ["robot pequeño", "pelota naranja"]
+    originals = [p.strip() for p in prompt.split(",") if p.strip()] or [prompt]
+    english = [_translate(p) for p in originals]      # SAM 3 trabaja en inglés
+    yield {"type": "prompts", "pairs": [[o, e] for o, e in zip(originals, english)]}
 
     for fi, img in enumerate(frames):
         dets = []
-        for p in prompts:
-            dets.extend(_detect(img, p))        # una pasada por concepto
+        for orig, eng in zip(originals, english):
+            for d in _detect(img, eng):              # detectar con el inglés
+                d["label"] = orig                    # pero mostrar lo que escribiste
+                dets.append(d)
         tracked = tracker.update(dets)
         per_frame.append(tracked)
         for tid, d, _ in tracked:
