@@ -267,8 +267,8 @@ def process_video(frames, prompt, min_presence=0.25, export_path=None, fps_out=1
             "id": int(tid),
             "color": list(color_of[tid]),
             "label": d.get("label", prompt),
-            "trail": [[float(dd["centroid"][0]), float(dd["centroid"][1])]
-                      for _, dd in obj_frames[tid]],
+            "trail": [[int(fi), float(dd["centroid"][0]), float(dd["centroid"][1])]
+                      for fi, dd in obj_frames[tid]],
             "thumb_png": _png_b64(rgba),
         })
 
