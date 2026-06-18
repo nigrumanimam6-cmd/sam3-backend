@@ -117,9 +117,8 @@ def _translate(text):
         return text
 
 
-def _detect(image_pil, prompt, min_score=None):
+def _detect(image_pil, prompt):
     """Devuelve la lista de detecciones (multi-objeto) de UN frame."""
-    ms = MIN_SCORE if min_score is None else min_score
     img = np.array(image_pil)
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         state = _processor.set_image(image_pil)
@@ -128,7 +127,7 @@ def _detect(image_pil, prompt, min_score=None):
     dets = []
     for i in range(int(masks.shape[0])):
         sc = float(scores[i].float().cpu())
-        if sc < ms:
+        if sc < MIN_SCORE:
             continue
         m = masks[i, 0].float().cpu().numpy()
         mb = m > (0.5 if m.max() <= 1.0 + 1e-3 else 0.0)
@@ -146,54 +145,8 @@ def _detect(image_pil, prompt, min_score=None):
     return dets
 
 
-def _order_quad(pts):
-    """Ordena 4 puntos como [sup-izq, sup-der, inf-der, inf-izq]."""
-    pts = np.array(pts, dtype=float)
-    s = pts[:, 0] + pts[:, 1]
-    d = pts[:, 0] - pts[:, 1]
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmax(d)]
-    bl = pts[np.argmin(d)]
-    return [tl.tolist(), tr.tolist(), br.tolist(), bl.tolist()]
-
-
-def _fit_quad(mask_bool):
-    """Ajusta un cuadrilátero a la máscara: intenta approxPolyDP (4 vértices),
-    si no, cae a minAreaRect (rectángulo rotado). Devuelve 4 esquinas o None."""
-    m = (mask_bool.astype(np.uint8)) * 255
-    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    c = max(cnts, key=cv2.contourArea)
-    hull = cv2.convexHull(c)
-    peri = cv2.arcLength(hull, True)
-    quad = None
-    for f in (0.02, 0.03, 0.05, 0.08, 0.10):
-        ap = cv2.approxPolyDP(hull, f * peri, True)
-        if len(ap) == 4:
-            quad = ap.reshape(-1, 2).astype(float)
-            break
-    if quad is None:
-        quad = cv2.boxPoints(cv2.minAreaRect(c)).astype(float)
-    return _order_quad(quad)
-
-
-def _detect_field(image_pil, prompts):
-    """Segmenta la cancha probando varios prompts y ajusta el rectángulo.
-    Devuelve (corners, prompt_usado, score) o (None, None, 0)."""
-    for p in prompts:
-        dets = _detect(image_pil, p, min_score=0.1)   # umbral bajo: la cancha
-        if not dets:                                   # puede puntuar bajo
-            continue
-        best = max(dets, key=lambda d: int(d["mask"].sum()))  # la más grande
-        quad = _fit_quad(best["mask"])
-        if quad is not None:
-            return quad, p, best["score"]
-    return None, None, 0.0
-
-
-
+class Tracker:
+    """Rastreador casero: empareja por IoU/centroide (con prediccion) + apariencia."""
     def __init__(self, w_img, match_thr=0.6, max_lost=30, w_motion=0.6):
         self.tracks, self.next_id = {}, 0
         self.w_img = w_img
@@ -458,28 +411,6 @@ async def ws(websocket: WebSocket):
                 await websocket.send_text(json.dumps({
                     "type": "mask", "prompt": msg.get("prompt", ""),
                     "n": n, "score": round(score, 4), "width": W, "height": H, "png": b64}))
-
-            # --- Auto-calibración: segmentar la cancha y devolver 4 esquinas -
-            elif t == "detect_field":
-                try:
-                    raw = base64.b64decode(msg["data"])
-                    img = Image.open(io.BytesIO(raw)).convert("RGB")
-                except Exception as e:
-                    await websocket.send_text(json.dumps(
-                        {"type": "field_error", "msg": f"imagen inválida: {e}"}))
-                    continue
-                user_p = (msg.get("prompt") or "").strip()
-                prompts = ([user_p] if user_p else []) + [
-                    "soccer field", "playing field", "green field", "field", "court"]
-                corners, used, score = _detect_field(img, prompts)
-                if corners is None:
-                    await websocket.send_text(json.dumps(
-                        {"type": "field_error", "msg": "no se detectó la cancha"}))
-                else:
-                    W, H = img.size
-                    await websocket.send_text(json.dumps({
-                        "type": "field", "corners": corners, "prompt": used,
-                        "score": round(float(score), 3), "width": W, "height": H}))
 
             # --- Carga de video en UN mensaje (para pruebas en Colab) -------
             elif t == "video":
