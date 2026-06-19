@@ -295,33 +295,33 @@ def process_video(frames, prompt, min_presence=0.25, export_path=None, fps_out=1
         writer = cv2.VideoWriter(export_path, cv2.VideoWriter_fourcc(*"mp4v"),
                                  float(fps_out) if fps_out else 10.0, (W, H))
 
-    # Luego, por frame: el original + las máscaras POR CAPA (id, caja, máscara)
+    # Luego, por frame: el original con el overlay YA HORNEADO en una sola
+    # imagen (como la celda de prueba). Así base y máscara son inseparables y
+    # no se pueden desfasar en la reproducción.
     sset = set(stable)
     for fi, tracked in enumerate(per_frame):
-        ov = np.zeros((H, W, 4), np.uint8)   # solo para el mp4 de descarga
+        ov = np.zeros((H, W, 4), np.uint8)
         objs = []
         for tid, d, _ in tracked:
             if tid in sset:
                 r, g, b = color_of[tid]
                 ov[d["mask"]] = [r, g, b, 130]
-                # máscara individual: blanca donde está el objeto, transparente el resto
-                mh = np.zeros((H, W, 4), np.uint8)
-                mh[d["mask"]] = [255, 255, 255, 255]
                 objs.append({
                     "id": int(tid),
                     "bbox": [int(x) for x in d["bbox"]],
-                    "mask_png": _png_b64(mh),
                 })
 
+        # Componer overlay sobre el frame -> UNA imagen RGB
+        base = np.array(frames[fi]).astype(np.float32)
+        a = ov[..., 3:4].astype(np.float32) / 255.0
+        comp = (base * (1 - a) + ov[..., :3] * a).astype(np.uint8)
+
         jb = io.BytesIO()
-        frames[fi].save(jb, format="JPEG", quality=70)
-        base_jpg = base64.b64encode(jb.getvalue()).decode("ascii")
-        yield {"type": "frame", "frame": fi, "base_jpg": base_jpg, "objects": objs}
+        Image.fromarray(comp).save(jb, format="JPEG", quality=80)
+        comp_jpg = base64.b64encode(jb.getvalue()).decode("ascii")
+        yield {"type": "frame", "frame": fi, "comp_jpg": comp_jpg, "objects": objs}
 
         if writer is not None:
-            base = np.array(frames[fi])
-            a = ov[..., 3:4].astype(np.float32) / 255.0
-            comp = (base * (1 - a) + ov[..., :3] * a).astype(np.uint8)
             writer.write(cv2.cvtColor(comp, cv2.COLOR_RGB2BGR))
 
     if writer is not None:
